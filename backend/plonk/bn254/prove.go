@@ -285,77 +285,51 @@ func newInstance(ctx context.Context, spr *cs.SparseR1CS, pk *ProvingKey, fullWi
 	return &s, nil
 }
 
+//takes the input polynomial  *iop.Polynomial) 
+//from gnark and outputs icicle polynomial iciclebn254poly.DensePolynomial in non-montgomery form 
+func define_icicle_poly_coeff(gnark_poly *iop.Polynomial) iciclebn254poly.DensePolynomial {
+	// cast the coefficients to the correct type
+	icicle_coeffs := (iciclecore.HostSlice[fr.Element])(gnark_poly.Coefficients())
+	// create poly from coefficients on device in Mont form
+	var output iciclebn254poly.DensePolynomial
+	output.CreateFromCoefficients(icicle_coeffs)
+	output_As_device_slice := 	output.AsDeviceSlice(fr.Bytes)
+	// convert coeffs from mont to normal form via DeviceSlice
+	iciclebn254.FromMontgomery(&output_As_device_slice)
+	return output
+}
+
+///takes a u64 fr.Element (Gnark) and output a iciclebn254.Scalar in u32
+func icicle_u64tou32(x fr.Element)iciclebn254.ScalarField {
+	x_bits:= x.Bits()
+	x_u32 := iciclecore.ConvertUint64ArrToUint32Arr(x_bits[:])
+	var x_icicle_scalar iciclebn254.ScalarField
+	x_icicle_scalar.FromLimbs(x_u32)
+	return x_icicle_scalar
+}
+
 func (s *instance) initBlindingPolynomials() error {
 	s.bp[id_Bl] = getRandomPolynomial(order_blinding_L)
 	s.bp[id_Br] = getRandomPolynomial(order_blinding_R)
 	s.bp[id_Bo] = getRandomPolynomial(order_blinding_O)
 	s.bp[id_Bz] = getRandomPolynomial(order_blinding_Z)
+	
+	s.bp_icicle[id_Bl] = define_icicle_poly_coeff(s.bp[id_Bl])
+	s.bp_icicle[id_Br] = define_icicle_poly_coeff(s.bp[id_Br])
+	s.bp_icicle[id_Bo] = define_icicle_poly_coeff(s.bp[id_Bo])
+	s.bp_icicle[id_Bz] = define_icicle_poly_coeff(s.bp[id_Bz])
+
+	
+	//These are sanity checks, remove in final version because poly initiation had some issues because of 
+	//montgomery form not being supported in icicle_vector ops. Note that poly api
+	//uses a combination of NTT/INTT vector ops and linear operations for efficiency.
+	//it does in a greedy way though :) at the moment... 
+	// var two iciclebn254.ScalarField
+	// icicle_evalBl := s.bp_icicle[id_Bl].Eval(two.FromUint32(2)) 
+	// gnark_evalBl := s.bp[id_Bl].Evaluate(fr.NewElement(2))
+	// fmt.Println("icicle_evalBl",icicle_evalBl)
+	// fmt.Println("gnark_evalBl:" , icicle_u64tou32(gnark_evalBl))
 	close(s.chbp)
-	//create poly by copying it into icicle function
-	s.bp_icicle[id_Bl].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Bl].Coefficients()))
-	// s.bp_icicle[id_Br].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Br].Coefficients()))
-	// s.bp_icicle[id_Bo].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Bo].Coefficients()))
-	// s.bp_icicle[id_Bz].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Bz].Coefficients()))
-
-	//compare coefficients
-	var gnark_poly_coeff = s.bp[id_Bl].GetCoeff(1)
-	//
-	// gnark_poly_bits := gnark_poly_coeff.Bits()
-	// gnark_poly_limbs :=iciclecore.ConvertUint64ArrToUint32Arr(gnark_poly_bits[:])
-	// var gnark_poly_to_icicle_scalar iciclebn254.ScalarField
-	// gnark_poly_to_icicle_scalar.FromLimbs(gnark_poly_limbs)
-	//get icicle poly and make it u64
-	var icicle_poly_coeff = s.bp_icicle[id_Bl].GetCoeff(1)
-	icicle_poly_coeff_mont := iciclecore.ConvertUint32ArrToUint64Arr(icicle_poly_coeff.GetLimbs())
-
-	//compareu64 
-	fmt.Printf("extract icicle_poly_coeff_mont[1]: %v\n", icicle_poly_coeff_mont)
-	fmt.Printf("extract gnark[1]: %v\n", gnark_poly_coeff)
-
-	//basic check: both polys f_gnark(2) = f_icicle)(2)
-	// gnark field elements in u64 
-	var two_gnark = fr.NewElement(2)
-	// icicle field elements in u32 
-	var two_icicle iciclebn254.ScalarField
-	// eval polys do not agree or cannot be checked due to difference in u32/u64
-	var gnark_eval = s.bp[id_Bl].Evaluate(two_gnark)
-	var icicle_eval = s.bp_icicle[id_Bl].Eval(two_icicle)
-	
-	
-	//convert gnark(2) to icicle(2) by going from u64 to u32 limbs
-	two_gnark_u64 := two_gnark.Bits()
-	two_gnark_u32 := iciclecore.ConvertUint64ArrToUint32Arr(two_gnark_u64[:])
-	//put it in icicle form
-	var two_gnark_to_icicle iciclebn254.ScalarField
-	two_gnark_to_icicle.FromLimbs(two_gnark_u32)
-	//compare and it works
-	fmt.Printf("two_gnark_to_icicle.scalarfield: %v\n", two_gnark_to_icicle)
-	fmt.Printf("two_icicle.scalarfield: %v\n", two_icicle.FromUint32(2))
-	
-	//compare evals by converting to icicle_scalar
-	//u64 f_gnark(2)
-	var gnark_eval_u64 = gnark_eval.Bits() 
-	//convert f_gnark(2) in u32 limbs
-	var gnark_eval_u32 = iciclecore.ConvertUint64ArrToUint32Arr(gnark_eval_u64[:])
-	//gnark_eval to icicle scalar
-	var gnark_eval_to_icicle_scalar iciclebn254.ScalarField
-	gnark_eval_to_icicle_scalar.FromLimbs(gnark_eval_u32)
-	//var zero iciclebn254.ScalarField
-	fmt.Printf("Icicle_eval_scalar: %v\n", icicle_eval)
-	fmt.Printf("gnark_eval_to_icicle_scalar : %v\n", gnark_eval_to_icicle_scalar)
-	
-
-	//polybits
-	// polyCoeffs := s.bp[id_Bl].Coefficients()
-	// polyIcicle := make(iciclecore.HostSlice[fr.Element], len(polyCoeffs))
-
-	// s.bp_icicle[id_Bl].CopyCoeffsRange(0, len(polyCoeffs)-1, polyIcicle)
-	// //it reads the same poly in device -- checked
-	// fmt.Printf("poly1: %v\n", polyCoeffs)
-	// fmt.Printf("poly2: %v\n", polyIcicle)
-	// ---
-	//check_evals
-
 	return nil
 }
 
