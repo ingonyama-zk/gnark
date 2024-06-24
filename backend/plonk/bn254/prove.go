@@ -53,6 +53,7 @@ import (
 	iciclecr "github.com/ingonyama-zk/icicle/v2/wrappers/golang/cuda_runtime"
 	iciclebn254 "github.com/ingonyama-zk/icicle/v2/wrappers/golang/curves/bn254"
 	iciclentt "github.com/ingonyama-zk/icicle/v2/wrappers/golang/curves/bn254/ntt"
+	iciclebn254poly "github.com/ingonyama-zk/icicle/v2/wrappers/golang/curves/bn254/polynomial"
 )
 
 const (
@@ -187,6 +188,12 @@ type instance struct {
 	h        *iop.Polynomial   // h is the quotient polynomial
 	blindedZ []fr.Element      // blindedZ is the blinded version of Z
 
+	//icicle polynomials 
+	//x_icicle []*iciclebn254poly.DensePolynomial
+	bp_icicle []iciclebn254poly.DensePolynomial
+	//h_icicle []*iciclebn254poly.DensePolynomial
+	//blindedZ_icicle []*iciclebn254.ScalarField
+
 	linearizedPolynomial       []fr.Element
 	linearizedPolynomialDigest kzg.Digest
 
@@ -228,6 +235,7 @@ func newInstance(ctx context.Context, spr *cs.SparseR1CS, pk *ProvingKey, fullWi
 		opt:                    opts,
 		fullWitness:            fullWitness,
 		bp:                     make([]*iop.Polynomial, nb_blinding_polynomials),
+		bp_icicle: 				make([]iciclebn254poly.DensePolynomial, nb_blinding_polynomials),
 		fs:                     fiatshamir.NewTranscript(opts.ChallengeHash, "gamma", "beta", "alpha", "zeta"),
 		kzgFoldingHash:         opts.KZGFoldingHash,
 		htfFunc:                opts.HashToFieldFn,
@@ -249,13 +257,17 @@ func newInstance(ctx context.Context, spr *cs.SparseR1CS, pk *ProvingKey, fullWi
 	sizeSystem := uint64(nbConstraints + len(spr.Public)) // len(spr.Public) is for the placeholder constraints
 	s.domain0 = fft.NewDomain(sizeSystem)
 
-	gen, _ := fft.Generator(3 * s.domain0.Cardinality)
+	gen, _ := fft.Generator(1 * s.domain0.Cardinality)
 	genBits := gen.Bits()
 	limbs := iciclecore.ConvertUint64ArrToUint32Arr(genBits[:])
 	var rouIcicle iciclebn254.ScalarField
 	rouIcicle.FromLimbs(limbs)
 	iciclectx, _ := iciclecr.GetDefaultDeviceContext()
 	iciclentt.InitDomain(rouIcicle, iciclectx, true)
+
+	//...initialize polynomial backend
+	iciclebn254poly.InitPolyBackend()
+	//...
 
 	// h, the quotient polynomial is of degree 3(n+1)+2, so it's in a 3(n+2) dim vector space,
 	// the domain is the next power of 2 superior to 3(n+2). 4*domainNum is enough in all cases
@@ -265,6 +277,7 @@ func newInstance(ctx context.Context, spr *cs.SparseR1CS, pk *ProvingKey, fullWi
 	} else {
 		s.domain1 = fft.NewDomain(4*sizeSystem, fft.WithoutPrecompute())
 	}
+	//note that icicle poly is not used for these small sizes
 
 	// build trace
 	s.trace = NewTrace(spr, s.domain0)
@@ -278,6 +291,71 @@ func (s *instance) initBlindingPolynomials() error {
 	s.bp[id_Bo] = getRandomPolynomial(order_blinding_O)
 	s.bp[id_Bz] = getRandomPolynomial(order_blinding_Z)
 	close(s.chbp)
+	//create poly by copying it into icicle function
+	s.bp_icicle[id_Bl].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Bl].Coefficients()))
+	// s.bp_icicle[id_Br].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Br].Coefficients()))
+	// s.bp_icicle[id_Bo].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Bo].Coefficients()))
+	// s.bp_icicle[id_Bz].CreateFromCoeffecitients((iciclecore.HostSlice[fr.Element])(s.bp[id_Bz].Coefficients()))
+
+	//compare coefficients
+	var gnark_poly_coeff = s.bp[id_Bl].GetCoeff(1)
+	//
+	// gnark_poly_bits := gnark_poly_coeff.Bits()
+	// gnark_poly_limbs :=iciclecore.ConvertUint64ArrToUint32Arr(gnark_poly_bits[:])
+	// var gnark_poly_to_icicle_scalar iciclebn254.ScalarField
+	// gnark_poly_to_icicle_scalar.FromLimbs(gnark_poly_limbs)
+	//get icicle poly and make it u64
+	var icicle_poly_coeff = s.bp_icicle[id_Bl].GetCoeff(1)
+	icicle_poly_coeff_mont := iciclecore.ConvertUint32ArrToUint64Arr(icicle_poly_coeff.GetLimbs())
+
+	//compareu64 
+	fmt.Printf("extract icicle_poly_coeff_mont[1]: %v\n", icicle_poly_coeff_mont)
+	fmt.Printf("extract gnark[1]: %v\n", gnark_poly_coeff)
+
+	//basic check: both polys f_gnark(2) = f_icicle)(2)
+	// gnark field elements in u64 
+	var two_gnark = fr.NewElement(2)
+	// icicle field elements in u32 
+	var two_icicle iciclebn254.ScalarField
+	// eval polys do not agree or cannot be checked due to difference in u32/u64
+	var gnark_eval = s.bp[id_Bl].Evaluate(two_gnark)
+	var icicle_eval = s.bp_icicle[id_Bl].Eval(two_icicle)
+	
+	
+	//convert gnark(2) to icicle(2) by going from u64 to u32 limbs
+	two_gnark_u64 := two_gnark.Bits()
+	two_gnark_u32 := iciclecore.ConvertUint64ArrToUint32Arr(two_gnark_u64[:])
+	//put it in icicle form
+	var two_gnark_to_icicle iciclebn254.ScalarField
+	two_gnark_to_icicle.FromLimbs(two_gnark_u32)
+	//compare and it works
+	fmt.Printf("two_gnark_to_icicle.scalarfield: %v\n", two_gnark_to_icicle)
+	fmt.Printf("two_icicle.scalarfield: %v\n", two_icicle.FromUint32(2))
+	
+	//compare evals by converting to icicle_scalar
+	//u64 f_gnark(2)
+	var gnark_eval_u64 = gnark_eval.Bits() 
+	//convert f_gnark(2) in u32 limbs
+	var gnark_eval_u32 = iciclecore.ConvertUint64ArrToUint32Arr(gnark_eval_u64[:])
+	//gnark_eval to icicle scalar
+	var gnark_eval_to_icicle_scalar iciclebn254.ScalarField
+	gnark_eval_to_icicle_scalar.FromLimbs(gnark_eval_u32)
+	//var zero iciclebn254.ScalarField
+	fmt.Printf("Icicle_eval_scalar: %v\n", icicle_eval)
+	fmt.Printf("gnark_eval_to_icicle_scalar : %v\n", gnark_eval_to_icicle_scalar)
+	
+
+	//polybits
+	// polyCoeffs := s.bp[id_Bl].Coefficients()
+	// polyIcicle := make(iciclecore.HostSlice[fr.Element], len(polyCoeffs))
+
+	// s.bp_icicle[id_Bl].CopyCoeffsRange(0, len(polyCoeffs)-1, polyIcicle)
+	// //it reads the same poly in device -- checked
+	// fmt.Printf("poly1: %v\n", polyCoeffs)
+	// fmt.Printf("poly2: %v\n", polyIcicle)
+	// ---
+	//check_evals
+
 	return nil
 }
 
